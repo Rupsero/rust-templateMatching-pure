@@ -49,6 +49,10 @@ Results (2 matches):
 
 Matches are outlined in green, centers marked in red.
 
+## Contributing
+
+Feedback, bug reports, and pull requests are welcome — feel free to open an issue or reach out.
+
 ## Credits
 
 This project is a pure-Rust reimplementation of algorithms from:
