@@ -1,0 +1,11 @@
+[package]
+name = "rust_tm_pure"
+version = "0.1.0"
+edition = "2024"
+
+# One dependency: pure-Rust PNG/JPEG/BMP decoder — no C compiler, no cmake, no system libs.
+[dependencies]
+image = "0.25"
+
+[profile.release]
+opt-level = 3
