@@ -48,3 +48,10 @@ Results (2 matches):
 ```
 
 Matches are outlined in green, centers marked in red.
+
+## Credits
+
+This project is a pure-Rust reimplementation of algorithms from:
+
+- [DennisLiu1993/Fastest_Image_Pattern_Matching](https://github.com/DennisLiu1993/Fastest_Image_Pattern_Matching)
+- [acai66/opencv_matching](https://github.com/acai66/opencv_matching)
