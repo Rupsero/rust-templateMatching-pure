@@ -43,6 +43,8 @@ cargo build --release
 Results (2 matches):
   [0]  center: (333.00, 111.00)   score: 1.0000
   [1]  center: (1423.00, 111.00)  score: 0.8142
+
+~0.9 ms  (Apple M-series, release build)
 ```
 
 Matches are outlined in green, centers marked in red.
