@@ -338,75 +338,28 @@ pub fn ccorr_direct(src: &Image, templ: &Image) -> MatF32 {
     let sw = src.width;
     let mut result = MatF32::new(rw, rh);
 
-    let n_threads = if rh * rw < 1024 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(rh)
-    };
-
-    if n_threads <= 1 {
-        // Single-threaded hot path — LLVM emits NEON udot / AVX2 vpmaddubsw.
-        let src_ptr   = src.data.as_ptr();
-        let templ_ptr = templ.data.as_ptr();
-        for r in 0..rh {
-            let res_row = result.row_mut(r);
-            for c in 0..rw {
-                let mut acc: u64 = 0;
-                let src_base = r * sw + c;
-                unsafe {
-                    for tr in 0..th {
-                        let sp = src_ptr.add(src_base + tr * sw);
-                        let tp = templ_ptr.add(tr * tw);
-                        let mut row_acc: u32 = 0;
-                        for tc in 0..tw {
-                            row_acc += *sp.add(tc) as u32 * *tp.add(tc) as u32;
-                        }
-                        acc += row_acc as u64;
+    // LLVM emits NEON udot / AVX2 vpmaddubsw for this pattern.
+    // Outer-level parallelism comes from rayon (scale loop), not from here.
+    let src_ptr   = src.data.as_ptr();
+    let templ_ptr = templ.data.as_ptr();
+    for r in 0..rh {
+        let res_row = result.row_mut(r);
+        for c in 0..rw {
+            let mut acc: u64 = 0;
+            let src_base = r * sw + c;
+            unsafe {
+                for tr in 0..th {
+                    let sp = src_ptr.add(src_base + tr * sw);
+                    let tp = templ_ptr.add(tr * tw);
+                    let mut row_acc: u32 = 0;
+                    for tc in 0..tw {
+                        row_acc += *sp.add(tc) as u32 * *tp.add(tc) as u32;
                     }
+                    acc += row_acc as u64;
                 }
-                res_row[c] = acc as f32;
             }
+            res_row[c] = acc as f32;
         }
-    } else {
-        let chunk_rows = (rh + n_threads - 1) / n_threads;
-        let src_data   = &src.data[..];
-        let templ_data = &templ.data[..];
-        std::thread::scope(|s| {
-            // Collect handles so all threads are spawned before any join.
-            let _handles: Vec<_> = result.data
-                .chunks_mut(chunk_rows * rw)
-                .enumerate()
-                .map(|(chunk_idx, chunk)| {
-                    let r_start = chunk_idx * chunk_rows;
-                    s.spawn(move || {
-                        let src_ptr   = src_data.as_ptr();
-                        let templ_ptr = templ_data.as_ptr();
-                        for (local_r, res_row) in chunk.chunks_mut(rw).enumerate() {
-                            let r = r_start + local_r;
-                            for c in 0..rw {
-                                let mut acc: u64 = 0;
-                                let src_base = r * sw + c;
-                                unsafe {
-                                    for tr in 0..th {
-                                        let sp = src_ptr.add(src_base + tr * sw);
-                                        let tp = templ_ptr.add(tr * tw);
-                                        let mut row_acc: u32 = 0;
-                                        for tc in 0..tw {
-                                            row_acc += *sp.add(tc) as u32 * *tp.add(tc) as u32;
-                                        }
-                                        acc += row_acc as u64;
-                                    }
-                                }
-                                res_row[c] = acc as f32;
-                            }
-                        }
-                    })
-                })
-                .collect();
-        });
     }
     result
 }
@@ -446,6 +399,38 @@ pub fn ccoeff_normalize(
             };
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bilinear resize
+// ---------------------------------------------------------------------------
+
+/// Resize `img` to (new_w × new_h) with bilinear interpolation (pixel-centre alignment).
+pub fn resize_bilinear(img: &Image, new_w: usize, new_h: usize) -> Image {
+    let mut out = Image::new(new_w, new_h);
+    if new_w == 0 || new_h == 0 { return out; }
+    let sx = img.width  as f32 / new_w as f32;
+    let sy = img.height as f32 / new_h as f32;
+    let sw = img.width  as i32;
+    let sh = img.height as i32;
+    for oy in 0..new_h {
+        let src_y = (oy as f32 + 0.5) * sy - 0.5;
+        let y0 = src_y.floor() as i32;
+        let fy = (src_y - y0 as f32).max(0.0);
+        for ox in 0..new_w {
+            let src_x = (ox as f32 + 0.5) * sx - 0.5;
+            let x0 = src_x.floor() as i32;
+            let fx = (src_x - x0 as f32).max(0.0);
+            let smp = |ix: i32, iy: i32| -> f32 {
+                img.data[iy.clamp(0, sh-1) as usize * img.width
+                        + ix.clamp(0, sw-1) as usize] as f32
+            };
+            let v = (1.0-fy) * ((1.0-fx) * smp(x0, y0)   + fx * smp(x0+1, y0))
+                  +      fy  * ((1.0-fx) * smp(x0, y0+1) + fx * smp(x0+1, y0+1));
+            out.data[oy * new_w + ox] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -2,3 +2,5 @@ target/
 result_pure.png
 template_matching_scene.png
 template_matching_template.png
+.DS_Store
+*.zip

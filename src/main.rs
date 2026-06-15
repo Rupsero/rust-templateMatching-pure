@@ -18,7 +18,7 @@ fn load_gray(path: &str) -> Option<Image> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <template.png> <source.png> [score_thresh] [max_count] [angle] [min_area]", args[0]);
+        eprintln!("Usage: {} <template.png> <source.png> [score_thresh] [max_count] [angle] [min_area] [scale_min] [scale_max]", args[0]);
         std::process::exit(1);
     }
 
@@ -28,28 +28,35 @@ fn main() {
     let max_count    = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10i32);
     let angle        = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0f64);
     let min_area     = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(256.0f64);
+    let scale_min    = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(1.0f64);
+    let scale_max    = args.get(8).and_then(|s| s.parse().ok()).unwrap_or(1.0f64);
 
     let templ = load_gray(templ_path).expect("Failed to load template image");
     let src   = load_gray(src_path).expect("Failed to load source image");
 
-    let param = MatcherParam { max_count, score_threshold: score_thresh,
-                               iou_threshold: 0.0, angle, min_area };
+    let param = MatcherParam {
+        max_count, score_threshold: score_thresh,
+        iou_threshold: 0.0, angle, min_area, scale_min, scale_max,
+    };
 
     let mut matcher = PatternMatcher::new(param);
-    matcher.set_template(&templ);
 
+    let t0 = std::time::Instant::now();
+    matcher.set_template(&templ);
+    let t1 = std::time::Instant::now();
     let results = matcher.match_image(&src);
+    let t2 = std::time::Instant::now();
+
+    eprintln!("set_template: {:.1}ms", (t1 - t0).as_secs_f64() * 1000.0);
+    eprintln!("match_image:  {:.1}ms", (t2 - t1).as_secs_f64() * 1000.0);
 
     println!("Results ({} matches):", results.len());
     for (i, r) in results.iter().enumerate() {
         println!("  [{i}]");
-        println!("    left_top:     ({:.2}, {:.2})", r.left_top.x,     r.left_top.y);
-        println!("    right_top:    ({:.2}, {:.2})", r.right_top.x,    r.right_top.y);
-        println!("    right_bottom: ({:.2}, {:.2})", r.right_bottom.x, r.right_bottom.y);
-        println!("    left_bottom:  ({:.2}, {:.2})", r.left_bottom.x,  r.left_bottom.y);
-        println!("    center:       ({:.2}, {:.2})", r.center.x,       r.center.y);
-        println!("    angle:        {:.4}°",         r.angle);
-        println!("    score:        {:.4}",           r.score);
+        println!("    center:  ({:.1}, {:.1})", r.center.x, r.center.y);
+        println!("    angle:   {:.2}°",         r.angle);
+        println!("    score:   {:.4}",           r.score);
+        println!("    scale:   {:.4}",           r.scale);
     }
 
     // Draw results on RGB image and save

@@ -7,6 +7,10 @@ pub struct MatcherParam {
     pub iou_threshold:   f64,
     pub angle:           f64,
     pub min_area:        f64,
+    /// Minimum template scale factor (1.0 = original size).  Set both to 1.0 to skip scaling.
+    pub scale_min:       f64,
+    /// Maximum template scale factor (1.0 = original size).
+    pub scale_max:       f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -21,4 +25,6 @@ pub struct MatchResult {
     pub center:       Point2d,
     pub angle:        f64,
     pub score:        f64,
+    /// Detected scale relative to the original template (1.0 = original size).
+    pub scale:        f64,
 }

@@ -2,7 +2,7 @@ use std::f64::consts::PI;
 
 use crate::image_ops::{
     Image, MatF32, build_pyramid, ccorr_direct, ccoeff_normalize,
-    integral_image, rotation_matrix, warp_affine, mean_std_dev,
+    integral_image, rotation_matrix, warp_affine, mean_std_dev, resize_bilinear,
 };
 use crate::matcher::{MatcherParam, MatchResult, Point2d};
 use crate::geometry::nms;
@@ -33,13 +33,16 @@ struct Candidate {
     pt_y: f64,
     score: f64,
     angle: f64,
+    /// Scale relative to the original template; set by the scale loop.
+    scale: f64,
     result_3x3: [[f32; 3]; 3],
     pos_on_border: bool,
 }
 
 impl Candidate {
     fn new(pt_x: f64, pt_y: f64, score: f64, angle: f64) -> Self {
-        Self { pt_x, pt_y, score, angle, result_3x3: [[0.0; 3]; 3], pos_on_border: false }
+        Self { pt_x, pt_y, score, angle, scale: 1.0,
+               result_3x3: [[0.0; 3]; 3], pos_on_border: false }
     }
 }
 
@@ -49,34 +52,50 @@ impl Candidate {
 
 pub struct PatternMatcher {
     param:      MatcherParam,
+    /// Original (unscaled) template — needed for the scale loop.
+    templ:      Option<Image>,
+    /// Pre-learned data at scale 1.0 (fast path when scale_min==scale_max==1.0).
     templ_data: Option<TemplData>,
 }
 
 impl PatternMatcher {
     pub fn new(param: MatcherParam) -> Self {
-        Self { param, templ_data: None }
+        Self { param, templ: None, templ_data: None }
     }
 
     pub fn set_template(&mut self, templ: &Image) -> i32 {
+        self.templ = None;
         self.templ_data = None;
         if templ.width == 0 || templ.height == 0 { return -1; }
-        let min_area = self.param.min_area;
-        self.templ_data = Some(learn_pattern(templ, min_area));
+        self.templ_data = Some(learn_pattern(templ, self.param.min_area));
+        self.templ = Some(templ.clone());
         0
     }
 
     pub fn match_image(&self, src: &Image) -> Vec<MatchResult> {
-        let td = match &self.templ_data {
-            Some(td) if !td.pyramid.is_empty() => td,
-            _ => return vec![],
-        };
-        match_impl(src, td, &self.param)
+        let scale_min = self.param.scale_min;
+        let scale_max = self.param.scale_max;
+        let is_single_scale = (scale_min - 1.0).abs() < VISION_TOLERANCE
+            && (scale_max - 1.0).abs() < VISION_TOLERANCE;
+
+        if is_single_scale {
+            let td = match &self.templ_data {
+                Some(td) if !td.pyramid.is_empty() => td,
+                _ => return vec![],
+            };
+            match_impl_single(src, td, &self.param)
+        } else {
+            let templ = match &self.templ {
+                Some(t) => t,
+                None => return vec![],
+            };
+            match_impl_scaled(templ, src, &self.param)
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helper: ptRotatePt2f equivalent
-// Positive angle_rad → same direction as OpenCV getRotationMatrix2D.
+// Helper: rotate a point around (cx, cy)
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -88,7 +107,7 @@ fn rotate_pt(x: f64, y: f64, cx: f64, cy: f64, angle_rad: f64) -> (f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
-// GetTopLayer: smallest pyramid level whose template area <= min_area
+// GetTopLayer
 // ---------------------------------------------------------------------------
 
 fn get_top_layer(w: usize, h: usize, min_side: usize) -> usize {
@@ -128,7 +147,6 @@ fn learn_pattern(templ: &Image, min_area: f64) -> TemplData {
         let (mean, std_dev) = mean_std_dev(img);
         let variance = std_dev * std_dev;
         result_equal1[i] = variance < f64::EPSILON;
-        // templ_norm = std_dev * sqrt(n) — mirrors C++ templNorm calculation
         let tnorm = std_dev / ia.sqrt();
         inv_area[i]   = ia;
         templ_mean[i] = mean;
@@ -168,7 +186,7 @@ fn best_rotation_size(src_w: usize, src_h: usize, angle_deg: f64) -> (usize, usi
 }
 
 // ---------------------------------------------------------------------------
-// GetRotatedROI: extract a rotated patch around pt_lt (with 3px padding)
+// GetRotatedROI
 // ---------------------------------------------------------------------------
 
 fn get_rotated_roi(src: &Image, templ_w: usize, templ_h: usize,
@@ -176,14 +194,12 @@ fn get_rotated_roi(src: &Image, templ_w: usize, templ_h: usize,
     let cx = (src.width  as f64 - 1.0) / 2.0;
     let cy = (src.height as f64 - 1.0) / 2.0;
 
-    // Where does ptLT land after the forward rotation?
     let rad = angle_deg * PI / 180.0;
     let (pt_lt_rot_x, pt_lt_rot_y) = rotate_pt(pt_lt_x, pt_lt_y, cx, cy, rad);
 
     let out_w = templ_w + 6;
     let out_h = templ_h + 6;
 
-    // Fast path for angle ≈ 0: avoid warpAffine and just crop + pad the source.
     if angle_deg.abs() < VISION_TOLERANCE {
         let ox = (pt_lt_rot_x - 3.0).round() as i32;
         let oy = (pt_lt_rot_y - 3.0).round() as i32;
@@ -197,7 +213,6 @@ fn get_rotated_roi(src: &Image, templ_w: usize, templ_h: usize,
     warp_affine(src, &m, out_w, out_h, border)
 }
 
-/// Crop a rectangular region starting at (ox, oy) from `src`, padding out-of-bounds with `border`.
 fn crop_padded(src: &Image, ox: i32, oy: i32, out_w: usize, out_h: usize, border: u8) -> Image {
     let mut out = Image::new(out_w, out_h);
     let sw = src.width as i32;
@@ -220,7 +235,7 @@ fn crop_padded(src: &Image, ox: i32, oy: i32, out_w: usize, out_h: usize, border
 }
 
 // ---------------------------------------------------------------------------
-// Match a rotated source against template at `layer` → CCOEFF_NORMED result
+// Match template at one pyramid layer
 // ---------------------------------------------------------------------------
 
 fn match_template_layer(src: &Image, td: &TemplData, layer: usize) -> MatF32 {
@@ -244,7 +259,7 @@ fn match_template_layer(src: &Image, td: &TemplData, layer: usize) -> MatF32 {
 }
 
 // ---------------------------------------------------------------------------
-// "Paint black" around ptMaxLoc and find next maximum
+// "Paint black" around peak and find next maximum
 // ---------------------------------------------------------------------------
 
 fn get_next_max(result: &mut MatF32, peak_x: usize, peak_y: usize,
@@ -279,7 +294,6 @@ fn sub_pix_estimation(candidates: &[Candidate], angle_step: f64, max_idx: usize)
                 let dy = cy + y as f64;
                 let dt = (ct + (theta - 1) as f64 * angle_step) * PI / 180.0;
                 mat_a[row] = [dx*dx, dy*dy, dt*dt, dx*dy, dx*dt, dy*dt, dx, dy, dt, 1.0];
-                // theta 0 → candidate max_idx-1, theta 1 → max_idx, theta 2 → max_idx+1
                 mat_s[row] = candidates[max_idx + theta as usize - 1].result_3x3[x as usize + 1][y as usize + 1] as f64;
                 row += 1;
             }
@@ -287,7 +301,6 @@ fn sub_pix_estimation(candidates: &[Candidate], angle_step: f64, max_idx: usize)
     }
 
     let z = solve_normal_equations(&mat_a, &mat_s);
-    // K1 * delta = K2,  where K1 = Hessian/2, K2 = -gradient
     let k1 = [
         [2.0*z[0],  z[3],      z[4]     ],
         [z[3],      2.0*z[1],  z[5]     ],
@@ -309,7 +322,6 @@ fn solve_normal_equations(a: &[[f64; 10]; 27], s: &[f64; 27]) -> [f64; 10] {
             }
         }
     }
-    // Gauss-Jordan with partial pivoting
     let mut aug = [[0.0f64; 11]; 10];
     for i in 0..10 {
         aug[i][..10].copy_from_slice(&ata[i]);
@@ -354,9 +366,7 @@ fn solve_3x3(a: [[f64; 3]; 3], b: [f64; 3]) -> [f64; 3] {
 }
 
 // ---------------------------------------------------------------------------
-// Per-candidate refinement — pure function, safe to run in parallel threads.
-// Walks pyramid layers from (top_layer-1) down to 0, narrowing position and
-// angle. Returns None if the candidate falls below the score threshold.
+// Per-candidate refinement (pyramid walk from top_layer-1 down to 0)
 // ---------------------------------------------------------------------------
 
 fn refine_candidate(
@@ -480,25 +490,29 @@ fn refine_candidate(
 }
 
 // ---------------------------------------------------------------------------
-// Main match implementation (mirrors PatternMatcher::match)
+// Inner match: takes a pre-built src_pyr, returns refined Candidates.
+//
+// `top_layer` is the coarsest level to use (may be < src_pyr.len()-1 when
+// the source pyramid was pre-built to a deeper level for a larger scale).
 // ---------------------------------------------------------------------------
 
-fn match_impl(src: &Image, td: &TemplData, param: &MatcherParam) -> Vec<MatchResult> {
-    let top_layer = td.pyramid.len() - 1;
+fn match_impl_inner(
+    src_pyr:   &[Image],
+    top_layer: usize,
+    td:        &TemplData,
+    param:     &MatcherParam,
+) -> Vec<Candidate> {
+    debug_assert!(src_pyr.len() > top_layer);
 
-    // Build source pyramid
-    let src_pyr = build_pyramid(src, top_layer);
-
-    let top_pyr_w  = src_pyr[top_layer].width;
-    let top_pyr_h  = src_pyr[top_layer].height;
+    let top_pyr_w = src_pyr[top_layer].width;
+    let top_pyr_h = src_pyr[top_layer].height;
     let top_cx = (top_pyr_w as f64 - 1.0) / 2.0;
     let top_cy = (top_pyr_h as f64 - 1.0) / 2.0;
 
-    // Angle step at top layer
-    let templ_top_max_side = td.pyramid[top_layer].width.max(td.pyramid[top_layer].height) as f64;
+    let templ_top_max_side =
+        td.pyramid[top_layer].width.max(td.pyramid[top_layer].height) as f64;
     let angle_step_top = (2.0 / templ_top_max_side).atan() * 180.0 / PI;
 
-    // Build angle list for top layer
     let angles_top: Vec<f64> = if param.angle < VISION_TOLERANCE {
         vec![0.0]
     } else {
@@ -516,16 +530,15 @@ fn match_impl(src: &Image, td: &TemplData, param: &MatcherParam) -> Vec<MatchRes
         v
     };
 
-    // Per-layer score thresholds (decay by 0.9 per level upward)
     let mut layer_score: Vec<f64> = vec![param.score_threshold; top_layer + 1];
     for l in 1..=top_layer {
         layer_score[l] = layer_score[l-1] * 0.9;
     }
 
-    // --- Stage 1: top layer rough match ---
     let templ_top_w = td.pyramid[top_layer].width;
     let templ_top_h = td.pyramid[top_layer].height;
 
+    // --- Stage 1: coarse search at top layer ---
     let mut top_candidates: Vec<Candidate> = Vec::new();
 
     for &angle in &angles_top {
@@ -539,7 +552,6 @@ fn match_impl(src: &Image, td: &TemplData, param: &MatcherParam) -> Vec<MatchRes
 
         let rot_src = warp_affine(&src_pyr[top_layer], &m, best_w, best_h, td.border_color);
 
-        // Skip if result map would be empty
         if best_w < templ_top_w || best_h < templ_top_h { continue; }
 
         let mut result = match_template_layer(&rot_src, td, top_layer);
@@ -547,7 +559,6 @@ fn match_impl(src: &Image, td: &TemplData, param: &MatcherParam) -> Vec<MatchRes
         let (_, _, mut max_val, mut max_loc) = result.min_max_loc();
         if (max_val as f64) < layer_score[top_layer] { continue; }
 
-        // Shift back by the translation applied to the rotation matrix
         top_candidates.push(Candidate::new(
             max_loc.0 as f64 - tx,
             max_loc.1 as f64 - ty,
@@ -571,49 +582,189 @@ fn match_impl(src: &Image, td: &TemplData, param: &MatcherParam) -> Vec<MatchRes
         }
     }
 
-    // Sort descending by score
     top_candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-    // --- Stage 2: refine from top layer down to layer 0 (parallel per candidate) ---
-    let mut all_results: Vec<Candidate> = std::thread::scope(|s| {
-        let handles: Vec<_> = top_candidates.iter()
-            .map(|tc| s.spawn(|| refine_candidate(
-                tc, &src_pyr, td, param, top_layer, &layer_score, top_cx, top_cy,
-            )))
-            .collect();
-        handles.into_iter()
-            .filter_map(|h| h.join().unwrap())
-            .collect()
-    });
+    // --- Stage 2: refine candidates ---
+    let mut all_results: Vec<Candidate> = top_candidates.iter()
+        .filter_map(|tc| refine_candidate(
+            tc, src_pyr, td, param, top_layer, &layer_score, top_cx, top_cy,
+        ))
+        .collect();
 
-    // Filter by score
     all_results.retain(|c| c.score >= param.score_threshold);
     all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    all_results
+}
 
-    // Build MatchResult list (using full-resolution template dimensions)
+// ---------------------------------------------------------------------------
+// Convert candidates → MatchResult.
+// iw / ih are the effective template dimensions in source-image pixels.
+// ---------------------------------------------------------------------------
+
+fn candidate_to_result(c: &Candidate, iw: f64, ih: f64, scale: f64) -> MatchResult {
+    let ra = -c.angle * PI / 180.0;
+    let (cos_a, sin_a) = (ra.cos(), ra.sin());
+    let lt = Point2d { x: c.pt_x, y: c.pt_y };
+    let rt = Point2d { x: lt.x + iw * cos_a, y: lt.y - iw * sin_a };
+    let lb = Point2d { x: lt.x + ih * sin_a, y: lt.y + ih * cos_a };
+    let rb = Point2d { x: rt.x + ih * sin_a, y: rt.y + ih * cos_a };
+    let center = Point2d {
+        x: (lt.x + rt.x + rb.x + lb.x) / 4.0,
+        y: (lt.y + rt.y + rb.y + lb.y) / 4.0,
+    };
+    let mut angle = -c.angle;
+    if angle < -180.0 { angle += 360.0; }
+    if angle >  180.0 { angle -= 360.0; }
+    MatchResult { left_top: lt, right_top: rt, left_bottom: lb, right_bottom: rb,
+                  center, angle, score: c.score, scale }
+}
+
+// ---------------------------------------------------------------------------
+// Single-scale fast path (scale == 1.0, uses pre-learned TemplData)
+// ---------------------------------------------------------------------------
+
+fn match_impl_single(src: &Image, td: &TemplData, param: &MatcherParam) -> Vec<MatchResult> {
+    let top_layer = td.pyramid.len() - 1;
+    let src_pyr = build_pyramid(src, top_layer);
+
+    let candidates = match_impl_inner(&src_pyr, top_layer, td, param);
+
     let iw = td.pyramid[0].width  as f64;
     let ih = td.pyramid[0].height as f64;
 
-    let match_results: Vec<MatchResult> = all_results.iter().take(param.max_count as usize * 2 + MATCH_CANDIDATE_NUM)
-        .map(|c| {
-            let ra = -c.angle * PI / 180.0;
-            let (cos_a, sin_a) = (ra.cos(), ra.sin());
-            let lt = Point2d { x: c.pt_x, y: c.pt_y };
-            let rt = Point2d { x: lt.x + iw * cos_a, y: lt.y - iw * sin_a };
-            let lb = Point2d { x: lt.x + ih * sin_a, y: lt.y + ih * cos_a };
-            let rb = Point2d { x: rt.x + ih * sin_a, y: rt.y + ih * cos_a };
-            let center = Point2d {
-                x: (lt.x + rt.x + rb.x + lb.x) / 4.0,
-                y: (lt.y + rt.y + rb.y + lb.y) / 4.0,
-            };
-            let mut angle = -c.angle;
-            if angle < -180.0 { angle += 360.0; }
-            if angle >  180.0 { angle -= 360.0; }
-            MatchResult { left_top: lt, right_top: rt, left_bottom: lb, right_bottom: rb,
-                          center, angle, score: c.score }
-        })
+    let results: Vec<MatchResult> = candidates.iter()
+        .take(param.max_count as usize * 2 + MATCH_CANDIDATE_NUM)
+        .map(|c| candidate_to_result(c, iw, ih, 1.0))
         .collect();
 
-    // NMS
-    nms(match_results, param.iou_threshold, param.max_count as usize)
+    nms(results, param.iou_threshold, param.max_count as usize)
+}
+
+// ---------------------------------------------------------------------------
+// Parabola sub-scale: given scores f_minus, f0, f_plus at equal spacing ds,
+// returns the offset Δ to the peak (|Δ| <= ds/2 when well-conditioned).
+// Returns None when the denominator is not negative (no concave peak).
+// ---------------------------------------------------------------------------
+
+fn parabola_peak_offset(f_minus: f64, f0: f64, f_plus: f64, ds: f64) -> Option<f64> {
+    let denom = 2.0 * (f_plus - 2.0 * f0 + f_minus);
+    if denom >= -1e-9 { return None; }
+    let delta = -(f_plus - f_minus) / denom * ds;
+    if delta.abs() <= ds { Some(delta) } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// Find the highest score among candidates within `radius` of (cx, cy).
+// ---------------------------------------------------------------------------
+
+fn best_score_near(cands: &[Candidate], cx: f64, cy: f64, radius2: f64) -> Option<f64> {
+    cands.iter()
+        .filter(|c| { let dx = c.pt_x - cx; let dy = c.pt_y - cy; dx*dx + dy*dy <= radius2 })
+        .map(|c| c.score)
+        .reduce(f64::max)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-scale match
+// ---------------------------------------------------------------------------
+
+fn match_impl_scaled(templ: &Image, src: &Image, param: &MatcherParam) -> Vec<MatchResult> {
+    let scale_min = param.scale_min.min(param.scale_max);
+    let scale_max = param.scale_max.max(param.scale_min);
+
+    let min_side = param.min_area.sqrt() as usize;
+
+    // Source pyramid: build once to the depth needed by the largest template (scale_max).
+    let max_tw = ((templ.width  as f64 * scale_max).round() as usize).max(1);
+    let max_th = ((templ.height as f64 * scale_max).round() as usize).max(1);
+    let max_top_layer = get_top_layer(max_tw, max_th, min_side);
+    let src_pyr = build_pyramid(src, max_top_layer);
+
+    let templ_max_side = templ.width.max(templ.height) as f64;
+
+    // Fixed scale step equivalent to the original (based on largest template size).
+    let coarse_ds = (2.0 / (templ_max_side * scale_max)).max(0.005);
+
+    let mut scale_list: Vec<f64> = Vec::new();
+    let mut s = scale_min;
+    loop {
+        let sc = s.min(scale_max);
+        if scale_list.last().map_or(true, |&last| (last - sc).abs() > 1e-9) {
+            scale_list.push(sc);
+        }
+        if s >= scale_max { break; }
+        s += coarse_ds;
+    }
+
+    // Per-scale matching in parallel; each scale is fully independent.
+    // std::thread::scope needs no extra dependency and gives the same speedup.
+    let mut scale_results: Vec<(f64, Vec<Candidate>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = scale_list.iter().map(|&scale| {
+            let templ   = &templ;
+            let src_pyr = &src_pyr;
+            let param   = &param;
+            scope.spawn(move || -> (f64, Vec<Candidate>) {
+                let sw = ((templ.width  as f64 * scale).round() as usize).max(1);
+                let sh = ((templ.height as f64 * scale).round() as usize).max(1);
+                if sw < 2 || sh < 2 { return (scale, vec![]); }
+                let scaled_templ = resize_bilinear(templ, sw, sh);
+                let td = learn_pattern(&scaled_templ, param.min_area);
+                let actual_top = td.pyramid.len() - 1;
+                let mut cands = match_impl_inner(&src_pyr, actual_top, &td, param);
+                for c in &mut cands { c.scale = scale; }
+                (scale, cands)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // --- Sub-scale parabola refinement ---
+    let proximity_r2 = {
+        let r = (max_tw.max(max_th) as f64 * 0.6).max(10.0);
+        r * r
+    };
+
+    struct Delta { si: usize, ci: usize, new_scale: f64 }
+    let mut deltas: Vec<Delta> = Vec::new();
+
+    for i in 0..scale_results.len() {
+        let scale = scale_results[i].0;
+        let prev: &[Candidate] = if i > 0 { &scale_results[i-1].1 } else { &[] };
+        let next: &[Candidate] = if i+1 < scale_results.len() { &scale_results[i+1].1 } else { &[] };
+        for (j, cand) in scale_results[i].1.iter().enumerate() {
+            let f0 = cand.score;
+            if let (Some(fm), Some(fp)) = (
+                best_score_near(prev, cand.pt_x, cand.pt_y, proximity_r2),
+                best_score_near(next, cand.pt_x, cand.pt_y, proximity_r2),
+            ) {
+                if let Some(delta) = parabola_peak_offset(fm, f0, fp, coarse_ds) {
+                    deltas.push(Delta { si: i, ci: j, new_scale: (scale + delta).clamp(scale_min, scale_max) });
+                }
+            }
+        }
+    }
+
+    for d in deltas {
+        scale_results[d.si].1[d.ci].scale = d.new_scale;
+    }
+
+    // --- Collect all candidates into MatchResults (using per-candidate refined scale) ---
+    let templ_w = templ.width  as f64;
+    let templ_h = templ.height as f64;
+    let max_keep = param.max_count as usize * 2 + MATCH_CANDIDATE_NUM;
+
+    let mut all_results: Vec<MatchResult> = Vec::new();
+    for (_, cands) in &scale_results {
+        for c in cands.iter().take(max_keep) {
+            let iw = templ_w * c.scale;
+            let ih = templ_h * c.scale;
+            all_results.push(candidate_to_result(c, iw, ih, c.scale));
+        }
+    }
+
+    // Filter, sort, then global NMS across all scales.
+    all_results.retain(|r| r.score >= param.score_threshold);
+    all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    nms(all_results, param.iou_threshold, param.max_count as usize)
 }
