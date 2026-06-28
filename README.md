@@ -4,6 +4,9 @@ Pure-Rust template matching — no OpenCV, no C dependencies, no cmake.
 Finds one or more occurrences of a template image inside a scene image,
 with optional rotation and scale invariance.
 
+**[Try it online →](https://template-matching.clubmate.space/)**  
+Upload your own images and explore rotation- and scale-invariant matching in the browser — no install needed.
+
 ## Features
 
 - **Pure Rust** — no system libraries, compiles anywhere `rustc` runs
